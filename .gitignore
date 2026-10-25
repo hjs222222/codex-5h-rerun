@@ -4,6 +4,11 @@ codex-watch.log
 watch-err.log
 watch-out.log
 
+# 本地截图/临时图片（保留 README 引用的截图）
+image/*
+!image/README/
+!image/README/*
+
 # Python 缓存
 __pycache__/
 *.pyc
