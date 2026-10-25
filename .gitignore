@@ -1,0 +1,13 @@
+# 运行生成的个人配置（含会话 ID、本地路径），不上传
+codex-watch-config.json
+codex-watch.log
+watch-err.log
+watch-out.log
+
+# Python 缓存
+__pycache__/
+*.pyc
+
+# 系统/编辑器
+.DS_Store
+Thumbs.db
