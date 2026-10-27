@@ -42,7 +42,7 @@ CONFIG_PATH = Path(__file__).resolve().parent / "codex-watch-config.json"
 LOG_PATH = Path(__file__).resolve().parent / "codex-watch.log"
 
 WINDOW_SECONDS = 5 * 3600          # 滚动 5h 窗口
-DEFAULT_POLL = 15                  # 事件轮询间隔（秒）
+DEFAULT_POLL = 30                  # 事件轮询间隔（秒），unsnooze 同款 30s tick
 DEFAULT_PROMPT = "继续上次未完成的任务，从断点接着做。"
 DEFAULT_EXTRA = ["--skip-git-repo-check"]
 CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
@@ -125,6 +125,8 @@ class Core:
         self.hit = None                # 最新到限事件 {ts, message, session_id, cwd}
         self.rolling = deque()         # (epoch_utc, total_tokens)
         self.rolling_max = 0
+        self.percent_pts = deque()     # (epoch_utc, used5h_percent) —— 实时监测的消耗点序列
+        self.limits = {}              # limit_id -> 该桶最新 rate_limits 聚合（5h/周/credits）
         self.process_pids = []
         self.status = "ok"             # ok | limited | waiting | resuming | error
         self.resume_started = 0        # 时间戳（避免同一 hit 重复续跑）
@@ -172,26 +174,10 @@ class Core:
             ts = evt.get("timestamp") or ""
             info = payload.get("info") or {}
             rl = payload.get("rate_limits") or {}
-            cred = rl.get("credits") or {}
-            new_snap = {
-                "ts": ts,
-                "plan": rl.get("plan_type"),
-                "limit_id": rl.get("limit_id"),
-                "credits_has": cred.get("has_credits"),
-                "credits_unlimited": cred.get("unlimited"),
-                "credits_balance": cred.get("balance"),
-                "total": (info.get("total_token_usage") or {}).get("total_tokens", 0),
-            }
-            changed = False
-            with self.lock:
-                if self.snap and ts <= self.snap.get("ts", ""):
-                    return                    # 只保留时间戳最新的快照
-                changed = (self.snap.get("plan") != new_snap["plan"] or
-                           self.snap.get("limit_id") != new_snap["limit_id"] or
-                           self.snap.get("credits_balance") != new_snap["credits_balance"])
-                self.snap = new_snap
-            if changed:                       # 只在额度状态变化时记日志，避免刷屏
-                self.log("INFO", f"额度快照更新：plan={new_snap['plan']} 桶={new_snap['limit_id']} credits={new_snap['credits_balance']}")
+            total = (info.get("total_token_usage") or {}).get("total_tokens", 0)
+            self._apply_limits(rl, total, ts, ts_epoch)
+
+
 
         elif etype == "event_msg" and payload.get("type") == "task_complete":
             err = payload.get("error") or {}
@@ -214,6 +200,84 @@ class Core:
                 self.rolling.append((ts_epoch, total))
                 self._prune_rolling()
                 self.rolling_max = max(self.rolling_max, total)
+
+    def _apply_limits(self, rl, total, ts, evt_ts):
+        """按 limit_id 分桶聚合最新额度。0%/None 防污染：同一 5h 窗口（resets5h 相同）
+        且新值为无效/0 时忽略（Codex 有时会写入窗口未变的 0% 事件）；窗口回退保护：
+        resets5h 早于当前值的旧窗口事件一律丢弃。"""
+        cred = rl.get("credits") or {}
+        p = rl.get("primary") or {}
+        s_ = rl.get("secondary") or {}
+        lid = rl.get("limit_id") or "?"
+        pct5, reset5 = p.get("used_percent"), p.get("resets_at")
+        pctw, resetw = s_.get("used_percent"), s_.get("resets_at")
+        new = {
+            "ts": ts, "plan": rl.get("plan_type"), "limit_id": lid,
+            "credits_has": cred.get("has_credits"),
+            "credits_unlimited": cred.get("unlimited"),
+            "credits_balance": cred.get("balance"),
+            "total": total,
+            "used5h": pct5, "resets5h": reset5,
+            "used_week": pctw, "resets_week": resetw,
+            "used_percent": pct5, "resets_at": reset5,   # 兼容旧字段
+        }
+        changed = False
+        with self.lock:
+            cur = self.limits.get(lid)
+            if cur and ts <= cur.get("ts", ""):
+                return                              # 只保留时间戳最新的
+            # 同窗口判定：resets_at 服务端每秒漂移，用 ±1h 容忍（窗口重置是 5h 级）
+            same_window = False
+            if cur and reset5 and cur.get("resets5h"):
+                try:
+                    same_window = abs(int(reset5) - int(cur.get("resets5h"))) < 3600
+                except Exception:
+                    same_window = False
+            if cur and same_window and not isinstance(pct5, (int, float)):
+                return                              # 同窗口且无百分比 → 忽略垃圾事件
+            if cur and same_window and isinstance(pct5, (int, float)) and pct5 <= 0:
+                return                              # 同窗口 0% 垃圾事件（窗口未重置却报 0）
+            changed = (not cur or cur.get("used5h") != pct5 or cur.get("used_week") != pctw)
+            self.limits[lid] = new
+            self.snap = dict(new)                   # 兼容旧 GUI/CLI 字段
+            # 消耗点序列（主桶 5h%）：回落（跨窗口重置）则清空重计；去重防噪声
+            if isinstance(pct5, (int, float)):
+                if self.percent_pts and pct5 < (self.percent_pts[-1][1] - 5.0):
+                    self.percent_pts.clear()
+                last_t = self.percent_pts[-1][0] if self.percent_pts else 0.0
+                if evt_ts - last_t >= 5.0:
+                    self.percent_pts.append((evt_ts, float(pct5)))
+                    while len(self.percent_pts) > 120:
+                        self.percent_pts.popleft()
+        if changed:
+            self.log("INFO", f"额度更新：桶={lid} 5h={pct5}% 周={pctw}% credits={new['credits_balance']}")
+
+    def main_limit_id(self):
+        """账号主额度桶：优先 codex（plus 计划主要配额桶）。"""
+        with self.lock:
+            if not self.limits:
+                return None
+            if "codex" in self.limits:
+                return "codex"
+            return max(self.limits, key=lambda k: (self.limits[k].get("resets5h") or 0))
+
+    def main_limits(self):
+        lid = self.main_limit_id()
+        with self.lock:
+            return dict(self.limits.get(lid) or {}) if lid else {}
+
+    def reset_time(self, hit):
+        """权威恢复点：优先用主桶 rate_limits.resets_at（epoch，无时区歧义），
+        其次解析 "try again at ..." 文本，最后兜底按滚动窗口估算。"""
+        m = self.main_limits()
+        ra = m.get("resets_at")
+        if ra:
+            try:
+                return datetime.fromtimestamp(int(ra))
+            except Exception:
+                pass
+        return (self.parse_reset(hit["message"], self._epoch(hit["ts"]))
+                or self.estimate_reset())
 
     def _prune_rolling(self):
         cut = time.time() - WINDOW_SECONDS
@@ -315,6 +379,53 @@ class Core:
             return c["resume_session_id"]
         return fallback
 
+
+    # ---------- 实时额度：消耗速率与到限预测 ----------
+    def burn_metrics(self):
+        """参考 unsnooze usage：用窗口用量百分比时间序列算消耗速率（%/min）
+        与按当前速率距触顶的 ETA 区间（band，估算值）。返回 dict 或 None。"""
+        m = self.main_limits()
+        with self.lock:
+            pts = list(self.percent_pts)
+        pct_now = m.get("used5h") if m else None
+        snap_ts = m.get("ts") if m else None
+        rates = []
+        for (t0, v0), (t1, v1) in zip(pts, pts[1:]):
+            dt = t1 - t0
+            if dt < 60 or dt > 2700:          # 剔除 <1min 噪声与 >45min 空闲 gap
+                continue
+            rates.append((v1 - v0) / (dt / 60.0))
+        if not rates:
+            return {"per_min": None, "lo": None, "hi": None, "pct_now": pct_now,
+                    "points": len(pts), "snap_ts": snap_ts, "age_s": None}
+        recent = rates[-6:] if len(rates) >= 6 else rates
+        lo, hi = min(recent), max(recent)
+        return {
+            "per_min": sum(recent) / len(recent),
+            "lo": lo, "hi": hi,
+            "pct_now": pct_now,
+            "points": len(pts),
+            "snap_ts": snap_ts,
+            "age_s": (time.time() - self._epoch(snap_ts)) if snap_ts else None,
+        }
+
+    def eta_band(self, metrics):
+        """由速率区间推出距到限的 ETA 区间（分钟）。数据不足时返回 None。"""
+        if not metrics or not metrics["per_min"] or metrics["per_min"] <= 0:
+            return None
+        pct = metrics["pct_now"]
+        if pct is None:
+            return None
+        remain_pct = max(0.0, 100.0 - float(pct))
+        if remain_pct <= 0:
+            return (0, 0)
+        hi_min = remain_pct / max(metrics["lo"], 1e-9) if metrics["lo"] > 0 else None
+        lo_min = remain_pct / max(metrics["hi"], 1e-9) if metrics["hi"] > 0 else None
+        if lo_min is None or hi_min is None:
+            return None
+        lo_min, hi_min = min(lo_min, hi_min), max(lo_min, hi_min)
+        return (lo_min, hi_min)
+
     def _maybe_auto_resume(self):
         if not self.cfg["auto_resume"]:
             return
@@ -330,7 +441,7 @@ class Core:
             self._auto_attempts = 0
             self._auto_succeeded = False
             self._auto_max_warned = False
-        if status == "resuming" or self._auto_succeeded:
+        if status in ("resuming", "probing") or self._auto_succeeded:
             return
         mx = int(self.cfg.get("auto_resume_max") or 0)
         if 0 < mx <= self._auto_attempts:
@@ -338,11 +449,61 @@ class Core:
                 self._auto_max_warned = True
                 self.log("WARN", f"已达自动续跑次数上限（{mx} 次），不再自动续跑；可点“手动续跑”或在设置中调大次数")
             return
-        reset = self.parse_reset(hit["message"], self._epoch(hit["ts"])) or self.estimate_reset()
+        reset = self.reset_time(hit)
         if reset and time.time() >= reset.timestamp():
             self._auto_attempts += 1
-            self.log("INFO", f"自动续跑 第 {self._auto_attempts} 次" + ("" if mx <= 0 else f"（上限 {mx} 次）"))
-            self.start_resume(self.resolve_target(hit["session_id"] or "latest"))
+            self.log("INFO", f"恢复点已到，先探测额度（第 {self._auto_attempts} 次" + ("" if mx <= 0 else f"/上限 {mx} 次") + "）")
+            with self.lock:
+                self.status = "probing"
+            threading.Thread(target=self._probe_and_resume, args=(hit,), daemon=True).start()
+
+    def _probe_once(self, cwd):
+        """静默探测额度：跑一个轻量 codex exec，成功=额度已恢复。不弹窗。"""
+        try:
+            p = subprocess.Popen(
+                ["codex", "exec", "--skip-git-repo-check",
+                 "额度探测：请只回复“OK”，不要执行任何操作。"],
+                cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, encoding="utf-8", errors="replace",
+                creationflags=CREATE_NO_WINDOW,
+            )
+            try:
+                out, _ = p.communicate(timeout=150)
+            except subprocess.TimeoutExpired:
+                p.kill()
+                self.log("WARN", "探测超时（150s），视为未恢复")
+                return False
+            low = out.lower()
+            if p.returncode == 0 and "usage limit" not in low and "usage_limit" not in low:
+                return True
+            self.log("RESUME", f"探测未通过（退出码 {p.returncode}），服务端片段：{out[-180:].strip()}")
+            return False
+        except Exception as e:
+            self.log("ERROR", f"探测异常：{e}")
+            return False
+
+    def _probe_and_resume(self, hit):
+        """探测成功才续跑；失败每 60 秒重试，直到成功或达上限。"""
+        cwd = hit.get("cwd") or None
+        sid = self.resolve_target(hit.get("session_id") or "latest")
+        while True:
+            if self._probe_once(cwd):
+                self.log("OK", "额度已恢复，开始自动续跑")
+                self.start_resume(sid)
+                return
+            mx = int(self.cfg.get("auto_resume_max") or 0)
+            if 0 < mx <= self._auto_attempts:
+                self.log("WARN", f"已达自动续跑探测上限（{mx} 次），停止自动续跑；可点“手动续跑”或调大次数")
+                with self.lock:
+                    self.status = "error"
+                return
+            self._auto_attempts += 1
+            self.log("WARN", f"额度尚未恢复，60 秒后重试探测（已试 {self._auto_attempts} 次" + ("" if mx <= 0 else f"/上限 {mx} 次") + "）")
+            for _ in range(12):
+                time.sleep(5)
+                with self.lock:
+                    if self._auto_succeeded or self._stop.is_set():
+                        return
 
     @staticmethod
     def _epoch(iso):
@@ -417,6 +578,7 @@ class Core:
         self._scan_again.set()
 
     def scan_now(self):
+        self.log("INFO", "手动刷新：立即扫描 rollout 增量")
         self._scan_again.set()
 
     def stop(self):
@@ -503,7 +665,7 @@ def probe(cfg):
     else:
         print("[快照] 暂无 token_count 事件")
     if hit:
-        reset = core.parse_reset(hit["message"], core._epoch(hit["ts"]))
+        reset = core.reset_time(hit)
         print(f"[到限] 会话={hit['session_id']} 事件时间={hit['ts']}")
         print(f"  服务端提示: {hit['message']}")
         print(f"  解析恢复时间: {reset}")
@@ -567,10 +729,10 @@ class WatchApp:
             cards.grid_columnconfigure(i, weight=1, uniform="kpi")
         self.kpi = {}
         self.kpi["bucket"] = _card(cards, "额度桶", "—", TEAL, 0, 0)
-        self.kpi["credits"] = _card(cards, "Credits 余额", "—", CYAN, 0, 1)
-        self.kpi["last_hit"] = _card(cards, "最近到限", "—", RED, 0, 2)
-        self.kpi["reset"] = _card(cards, "恢复时间", "—", AMBER, 0, 3)
-        self.kpi["usage5h"] = _card(cards, "5h 用量(tokens)", "—", BLUE, 0, 4)
+        self.kpi["use5h"] = _card(cards, "5h 用量", "—", BLUE, 0, 1)
+        self.kpi["usewk"] = _card(cards, "周用量", "—", PURPLE, 0, 2)
+        self.kpi["last_hit"] = _card(cards, "最近到限", "—", RED, 0, 3)
+        self.kpi["reset"] = _card(cards, "恢复时间", "—", AMBER, 0, 4)
         self.kpi["proc"] = _card(cards, "Codex 进程", "—", GREEN, 0, 5)
 
         # 中部：倒计时 + 图表
@@ -594,7 +756,37 @@ class WatchApp:
         self.progress.pack(fill="x", padx=20, pady=(4, 16))
         self.hit_msg = tk.Label(left, text="", bg=CARD_BG, fg=MUTED, wraplength=340,
                                 font=("Microsoft YaHei UI", 10), justify="left")
-        self.hit_msg.pack(fill="x", padx=14, pady=(0, 14))
+        self.hit_msg.pack(fill="x", padx=14, pady=(0, 6))
+
+        # 实时额度监测区（参考 unsnooze usage：5h / 周窗口用量条 + 消耗速率 + ETA）
+        live = tk.Frame(left, bg="#0e1526", highlightbackground="#1f2b47", highlightthickness=1)
+        live.pack(fill="x", padx=14, pady=(2, 12))
+        tk.Label(live, text="📡 实时额度（unsnooze 式监测）", bg="#0e1526", fg=CYAN,
+                 font=("Microsoft YaHei UI", 11, "bold")).pack(anchor="w", padx=10, pady=(8, 2))
+        row5 = tk.Frame(live, bg="#0e1526")
+        row5.pack(fill="x", padx=10, pady=(2, 2))
+        tk.Label(row5, text="5h 窗口", bg="#0e1526", fg="#9fe8c8", width=7, anchor="w",
+                 font=("Microsoft YaHei UI", 10, "bold")).pack(side="left")
+        self.usage_bar5 = tk.Canvas(row5, height=16, bg="#0b1220", highlightthickness=0)
+        self.usage_bar5.pack(side="left", fill="x", expand=True, padx=(4, 6))
+        self.use5h_lbl = tk.Label(row5, text="—", bg="#0e1526", fg=BLUE,
+                                  font=("Microsoft YaHei UI", 13, "bold"), width=7, anchor="e")
+        self.use5h_lbl.pack(side="left")
+        roww = tk.Frame(live, bg="#0e1526")
+        roww.pack(fill="x", padx=10, pady=(2, 2))
+        tk.Label(roww, text="周窗口", bg="#0e1526", fg="#c084fc", width=7, anchor="w",
+                 font=("Microsoft YaHei UI", 10, "bold")).pack(side="left")
+        self.usage_barw = tk.Canvas(roww, height=16, bg="#0b1220", highlightthickness=0)
+        self.usage_barw.pack(side="left", fill="x", expand=True, padx=(4, 6))
+        self.usewk_lbl = tk.Label(roww, text="—", bg="#0e1526", fg=PURPLE,
+                                  font=("Microsoft YaHei UI", 13, "bold"), width=7, anchor="e")
+        self.usewk_lbl.pack(side="left")
+        self.burn_text = tk.Label(live, text="消耗速率 — · 预测触顶 —", bg="#0e1526", fg=MUTED,
+                                  font=("Microsoft YaHei UI", 10), justify="left", anchor="w")
+        self.burn_text.pack(fill="x", padx=10, pady=(2, 0))
+        self.snap_age = tk.Label(live, text="额度快照 —", bg="#0e1526", fg=MUTED,
+                                 font=("Microsoft YaHei UI", 10), anchor="w")
+        self.snap_age.pack(fill="x", padx=10, pady=(0, 8))
 
         right = tk.Frame(mid, bg=CARD_BG, highlightbackground=BLUE, highlightthickness=1)
         right.grid(row=0, column=1, sticky="nsew", padx=6, pady=6)
@@ -704,20 +896,40 @@ class WatchApp:
         else:
             self.target_lbl.configure(text="目标：最近会话")
 
-        # KPI
+        # KPI（参考 unsnooze usage：5h / 周窗口用量百分比）
         self.plan_pill.configure(text="Plus" if snap.get("plan") else "—")
-        self.kpi["bucket"].value.configure(text=str(snap.get("limit_id") or "—"))
-        self.kpi["credits"].value.configure(text=str(snap.get("credits_balance") or "—"))
+        self.kpi["bucket"].value.configure(text=str(c.main_limit_id() or "—"))
+        mu = c.main_limits()
+        u5 = mu.get("used5h") if mu else None
+        uw = mu.get("used_week") if mu else None
+        self.kpi["use5h"].value.configure(
+            text=f"{u5:.0f}%" if isinstance(u5, (int, float)) else "—")
+        self.kpi["usewk"].value.configure(
+            text=f"{uw:.0f}%" if isinstance(uw, (int, float)) else "—")
         self.kpi["last_hit"].value.configure(text=(hit["ts"][11:19] + " UTC" if hit else "无"))
-        self.kpi["usage5h"].value.configure(text=f"{tokens:,}" if turns else "—")
+        if hit:
+            _rt = c.reset_time(hit)
+            if _rt:
+                if _rt.date() == datetime.now().date():
+                    self.kpi["reset"].value.configure(text="今天 " + _rt.strftime("%H:%M:%S"))
+                else:
+                    self.kpi["reset"].value.configure(text=_rt.strftime("%m-%d %H:%M"))
+            else:
+                self.kpi["reset"].value.configure(text="—")
+        else:
+            self.kpi["reset"].value.configure(text="—")
         self.kpi["proc"].value.configure(text=f"{len(pids)} 个" if pids else "未运行")
         self.kpi["proc"].value.configure(fg=GREEN if pids else MUTED)
 
         # 倒计时
         now = time.time()
-        if hit and status in ("limited", "waiting", "resuming"):
-            reset = c.parse_reset(hit["message"], c._epoch(hit["ts"])) or c.estimate_reset()
-            if reset:
+        if hit and status in ("limited", "waiting", "resuming", "probing"):
+            reset = c.reset_time(hit)
+            if status == "probing":
+                self.countdown_text.configure(text="探测中", fg=BLUE)
+                self.countdown_sub.configure(text="恢复点已到，正在探测额度…")
+                self.hit_msg.configure(text=hit["message"][:160])
+            elif reset:
                 remain = reset.timestamp() - now
                 if remain > 0:
                     h, rem = divmod(int(remain), 3600)
@@ -729,6 +941,7 @@ class WatchApp:
                     self._draw_progress(frac, color)
                 else:
                     self.countdown_text.configure(text="已到点", fg=GREEN)
+                    self.countdown_sub.configure(text="探测额度中…" if c.cfg["auto_resume"] else "已到点（自动续跑已关闭）")
             else:
                 self.countdown_text.configure(text="到限", fg=RED)
             self.hit_msg.configure(text=hit["message"][:160])
@@ -738,8 +951,64 @@ class WatchApp:
             self.hit_msg.configure(text="")
             self._draw_progress(0, GREEN)
 
+        # 实时额度监测（用量条 / 消耗速率 / ETA 区间 / 快照年龄）
+        self._update_live_metrics()
+
         # 图表
         self._draw_chart(rolling)
+
+    def _update_live_metrics(self):
+        c = self.core
+        m = c.burn_metrics()
+        mu = c.main_limits()
+        u5 = mu.get("used5h") if mu else None
+        uw = mu.get("used_week") if mu else None
+
+        def _draw(cv, pct):
+            cv.delete("all")
+            w = cv.winfo_width() or 320
+            cv.create_rectangle(2, 2, w - 2, 12, fill="#0b1220", outline="")
+            if isinstance(pct, (int, float)):
+                pct = max(0.0, min(100.0, float(pct)))
+                pc = BLUE if pct < 70 else (AMBER if pct < 90 else RED)
+                cv.create_rectangle(2, 2, 2 + (w - 4) * (pct / 100.0), 12, fill=pc, outline="")
+
+        _draw(self.usage_bar5, u5)
+        _draw(self.usage_barw, uw)
+        self.use5h_lbl.configure(
+            text=f"{u5:.0f}%" if isinstance(u5, (int, float)) else "—",
+            fg=GREEN if (isinstance(u5, (int, float)) and u5 >= 85) else BLUE)
+        self.usewk_lbl.configure(
+            text=f"{uw:.0f}%" if isinstance(uw, (int, float)) else "—",
+            fg=GREEN if (isinstance(uw, (int, float)) and uw >= 85) else PURPLE)
+
+        rate = m.get("per_min") if m else None
+        if rate and rate > 0:
+            rate_h = rate * 60
+            rate_s = f"{rate_h:.2f}%/小时"
+            eta = c.eta_band(m)
+            if eta:
+                lo, hi = eta
+                def _fmt(mins):
+                    hh = int(mins // 60); mm = int(mins % 60)
+                    return f"{hh}时{mm:02d}分" if hh else f"{mm}分"
+                eta_s = f"预测触顶 {_fmt(lo)} ~ {_fmt(hi)}（估算）"
+            else:
+                eta_s = "预测触顶 —（数据不足）"
+            self.burn_text.configure(text=f"消耗速率 {rate_s} · {eta_s}", fg="#9fe8c8")
+        else:
+            self.burn_text.configure(text="消耗速率 — · 预测触顶 —（数据不足，持续运行后自动估算）",
+                                     fg=MUTED)
+        age = m.get("age_s") if m else None
+        if age is None:
+            self.snap_age.configure(text="额度快照 —")
+        else:
+            a = int(age)
+            a_s = (f"{a}秒前更新" if a < 90 else
+                   f"{a // 60}分{a % 60}秒前更新" if a < 5400 else
+                   f"{a // 3600}小时前更新")
+            color = GREEN if a < 120 else (AMBER if a < 1800 else RED)
+            self.snap_age.configure(text=f"额度快照 {a_s}（tail 增量实时监听）", fg=color)
 
     def _draw_progress(self, frac, color):
         self.progress.delete("all")
@@ -1189,6 +1458,10 @@ def main():
     core = Core(cfg)
     core.log("OK", f"看板启动 · 轮询间隔 {cfg['poll_interval_sec']}s · 自动续跑 {'开' if cfg['auto_resume'] else '关'} · 次数上限 {cfg['auto_resume_max']}")
     root = tk.Tk()
+    root.deiconify()          # 保险：避免偶发启动即最小化/移出屏幕
+    root.lift()
+    root.attributes("-topmost", True)
+    root.after(600, lambda: root.attributes("-topmost", False))
     WatchApp(root, core)
     try:
         root.mainloop()
